@@ -1,0 +1,51 @@
+<?php
+
+/**
+ * Implementation of hook_install().
+ */
+function count_terms_install() {
+	drupal_install_schema('count_terms');
+	
+	// we have to set the weight high so that our module's hooks run after node and taxonomy
+	$sql = "UPDATE {system} SET weight = 10 WHERE name = 'count_terms'";
+	db_query($sql);
+	
+	// first we'll count all the number of published, current revisions for each term that has at least one
+	$sql = 'INSERT INTO {count_terms} (tid, node_count) (SELECT tid, COUNT(np.nid) FROM {term_node} tn LEFT JOIN {node} np ON tn.vid = np.vid AND np.status = 1 GROUP BY tid)';
+	db_query($sql);
+	
+	// then we'll say that if there is a term id that isnt in term_count_count then it has 0 nodes
+	$sql = 'INSERT INTO {count_terms} (tid, node_count) (SELECT tid, 0 FROM {term_data} WHERE tid NOT IN (SELECT tid FROM {count_terms}))';
+	db_query($sql);
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function count_terms_uninstall() {
+	drupal_uninstall_schema('count_terms');
+}
+
+/**
+ * Implementation of hook_schema().
+ */
+function count_terms_schema() {
+	$schema['count_terms'] = array(
+		'fields' => array(
+			'tid' => array(
+				'type' => 'int',
+				'unsigned' => TRUE,
+				'not null' => TRUE,
+				'default' => 0
+			),
+			'node_count' => array(
+				'type' => 'int',
+				'unsigned' => TRUE,
+				'not null' => TRUE,
+				'default' => 0
+			)
+		),
+		'primary key' => array('tid')
+	);
+	return $schema;
+}

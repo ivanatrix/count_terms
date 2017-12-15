@@ -1,0 +1,5 @@
+name = Count Terms
+description = Allow Views to display number of terms associated to a node
+core = 6.x
+dependencies[] = taxonomy
+

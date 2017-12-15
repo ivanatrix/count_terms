@@ -1,0 +1,207 @@
+<?php
+
+/**
+ * Implementation of hook_taxonomy().
+ */
+function count_terms_taxonomy($op, $type, $form_values) {
+	// shortcuts
+	$tid = $form_values['tid'];
+	$vid = $form_values['vid'];
+	
+	switch ($type) {
+		case 'term':
+			switch ($op) {
+				case 'insert':
+					$sql = 'INSERT INTO {count_terms} (tid) VALUES (%d)';
+					db_query($sql, $tid);
+					break;
+				case 'delete':
+					$sql = 'DELETE FROM {count_terms} WHERE tid = %d';
+					db_query($sql, $tid);
+					break;
+			}
+			break;
+		case 'vocabulary':
+			switch ($op) {
+				case 'delete':
+					$sql = 'DELETE FROM {count_terms} WHERE tid IN (SELECT tid FROM {term_data} WHERE vid = %d)';
+					db_query($sql, $vid);
+			}
+	}
+}
+
+/**
+ * Implementation of hook_nodeapi().
+ * 
+ * The idea here is to find out which terms are affected by varous node changes
+ * and send those term IDs to another function which will update count_terms
+ */
+function count_terms_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
+	static $saved_tids;
+	
+	//print '<h2>' . $op . '</h2><pre>' . print_r($node, 1) . '</pre>';
+	
+	switch ($op) {
+		case 'insert':
+			// since the node is first being created, all we have to do
+			// is check which terms were saved to term_node
+			$tids_to_update = count_terms_saved_terms($node);
+			count_terms_update($tids_to_update);
+			break;
+		case 'presave':
+			// when a node is updated we need to first get the tids previously saved
+			// this is only possible in the presave op because term_node hasn't been altered yet
+			if (isset($node->nid)) {
+				$saved_tids = count_terms_saved_terms($node);
+			}
+			break;
+		case 'update':
+			// $saved_tids is saved in a static variable
+			// we'll combine that with the proposed changes to the node, and that way we'll
+			// be able to get a full list of term ids that need to be updated
+			if (!empty($node->taxonomy)) {
+				$submitted_tids = count_terms_submitted_terms($node->taxonomy);
+				$tids_to_update = $saved_tids + $submitted_tids;
+				$tids_to_update = array_unique($tids_to_update);
+				count_terms_update($tids_to_update);
+			}
+			break;
+		case 'delete':
+			// the term ids that need to be updated are saved to the node already in $node->taxonomy
+			$tids_to_update = array();
+			foreach ($node->taxonomy as $tid => $term) {
+				$tids_to_update[$tid] = $tid;
+			}
+			count_terms_update($tids_to_update);
+			break;
+	}
+}
+
+/**
+ * Updates terms in count_terms given an array of tids.
+ */
+function count_terms_update($tids_to_update) {
+	// go through each tid provided, count the number of nodes attached
+	// to it and update the count_terms table
+	if (!empty($tids_to_update)) {
+		$sql = 'UPDATE {count_terms} SET node_count = %d WHERE tid = %d';
+		$counts = count_terms_count_nodes($tids_to_update);
+		foreach ($counts as $tid => $count) {
+			db_query($sql, $count, $tid);
+		}
+	}
+}
+
+/**
+ * Function used to count nodes. It's like taxonomy_term_count_nodes but without static caching.
+ * Also I don't think child terms should be included.
+ */
+function count_terms_count_nodes($terms) {
+	if (!empty($terms)) {
+		$tids_list = implode(',', $terms);
+		$tids_list = rtrim($tids_list, ',');
+		// note that we're only bringing back published nodes
+		$sql = "SELECT tid, COUNT(tid) AS count FROM {term_node} tn INNER JOIN {node} n ON tn.vid = n.vid WHERE tid IN (%s) AND n.status = 1 GROUP BY tid";
+		$result = db_query($sql, $tids_list);
+		$counts = array();
+		while ($term = db_fetch_object($result)) {
+			$counts[$term->tid] = $term->count;
+		}
+		
+		// if the term id didn't return any results, then there are no nodes attached to it
+		foreach ($terms as $tid) {
+			if (!isset($counts[$tid])) {
+				$counts[$tid] = 0;
+			}
+		}
+	}
+	
+	return $counts;
+}
+
+/**
+ * Find out which terms were previously saved so we can figure out how to update count_terms.
+ * 
+ * I hate node revisions.
+ */
+function count_terms_saved_terms($node) {
+	$saveds_tids = array();
+	$sql = 'SELECT tid FROM {term_node} tn INNER JOIN {node} n ON tn.vid = n.vid WHERE tn.vid = %d AND n.status = 1';
+	if (!$node->revision) {
+		// if there's no revisioning involved then this is a piece of cake
+		$result = db_query($sql, $node->vid);
+	}
+	else {
+		// this is a revision
+		if (!$node->revision_timestamp) {
+			// the user is creating a new revision
+			$result = db_query($sql, $node->vid);
+		}
+		else {
+			// the user is reverting back to an older revision
+			// the problem here is that instead of telling me the most recent vid
+			// drupal gives me the vid associated with whatever version we're reverting to
+			// to get around that i do some sql magic to get the revision for this node directly preceding the newest one
+			// i wish there was a better way to do it
+			$old_vid = db_result(db_query('SELECT vid FROM {node_revisions} WHERE nid = %d ORDER BY timestamp DESC LIMIT 1', $node->nid));
+			//print $old_vid;
+			$result = db_query($sql, $old_vid);
+		}
+	}
+	while ($tids = db_fetch_object($result)) {
+		$saveds_tids[$tids->tid] = $tids->tid;
+	}
+	return $saveds_tids;
+}
+
+/**
+ * Takes array provided by $node->taxonomy and filters it
+ */
+function count_terms_submitted_terms($taxonomy) {
+	$submitted_tids = array();
+	foreach ($taxonomy as $key => $value) {
+		if (!empty($value)) {
+			if ($key != 'tags') {
+				if (is_object($value)) {
+					// we're updating from admin/content/node
+					// objects with no properties are not considered empty
+					if (!empty($value->tid)) {
+						$submitted_tids[$value->tid] = $value->tid;
+					}
+				}
+				elseif (is_array($value)) {
+					foreach ($value as $tid) {
+						$submitted_tids[$tid] = $tid;
+					}
+				}
+				else {
+					$submitted_tids[$value] = $value;
+				}
+			}
+			else {
+				// special processing must be done for tagging vocabularies
+				foreach ($value as $vid => $tags) {
+					$tags = drupal_explode_tags($tags);
+					foreach ($tags as $tag) {
+						// we only get a term name, so we have to query term_data for a tid
+						// there could already be terms with the same name, so we select the
+						// highest tid because that will be the most recent one
+						$tid = db_result(db_query("SELECT MAX(tid) FROM {term_data} WHERE name = '%s'", $tag));
+						$submitted_tids[$tid] = $tid;
+					}
+				}
+			}
+		}
+	}
+	
+	return $submitted_tids;
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function count_terms_views_api() {
+	return array(
+		'api' => 2
+	);
+}
